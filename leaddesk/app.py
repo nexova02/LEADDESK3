@@ -37,10 +37,6 @@ def load_config(username=None):
     db.close()
     if row:
         return json.loads(row["config_json"])
-    # Fallback to file for backward compatibility if user_settings is empty
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH) as f:
-            return json.load(f)
     return {}
 
 def save_config(username, data):
