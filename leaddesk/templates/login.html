@@ -19,19 +19,25 @@
     <div class="alert alert-error">{{ error }}</div>
     {% endif %}
 
-    <form method="POST" action="/">
+    <form method="POST" action="{% if is_register %}{{ url_for('register') }}{% else %}{{ url_for('login') }}{% endif %}">
       <div class="form-group" style="margin-bottom:0.75rem;">
         <label>Username</label>
-        <input type="text" name="username" placeholder="user1 or user2" required autocomplete="username" />
+        <input type="text" name="username" placeholder="Enter username" required autocomplete="username" />
       </div>
       <div class="form-group" style="margin-bottom:1.1rem;">
         <label>Password</label>
-        <input type="password" name="password" placeholder="••••••••••" required autocomplete="current-password" />
+        <input type="password" name="password" placeholder="••••••••••" required autocomplete="{% if is_register %}new-password{% else %}current-password{% endif %}" />
       </div>
-      <button type="submit" class="btn btn-primary btn-full">Sign In</button>
+      <button type="submit" class="btn btn-primary btn-full">{% if is_register %}Sign Up{% else %}Sign In{% endif %}</button>
     </form>
 
-    <p class="login-hint">user1 / password123</p>
+    <p class="login-hint" style="margin-top: 1.5rem;">
+      {% if is_register %}
+        Already have an account? <a href="{{ url_for('login') }}" class="link">Sign In</a>
+      {% else %}
+        Need an account? <a href="{{ url_for('register') }}" class="link">Sign Up</a>
+      {% endif %}
+    </p>
   </div>
 </body>
 
