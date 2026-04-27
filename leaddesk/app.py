@@ -8,13 +8,14 @@ import imaplib, email as email_lib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header as dh
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from flask import (Flask, render_template, request, redirect,
                    url_for, session, jsonify, g, make_response, flash)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "nexova-secret-2024")
+app.permanent_session_lifetime = timedelta(days=30)
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 DB_PATH     = os.path.join(BASE_DIR, "leads.db")
@@ -159,6 +160,7 @@ def login():
         user = db.execute("SELECT * FROM users WHERE username=?", (u,)).fetchone()
         
         if user and user["password"] == p:
+            session.permanent = True
             session["user"] = u
             db.close()
             return redirect(url_for("dashboard"))
@@ -182,6 +184,7 @@ def register():
             try:
                 db.execute("INSERT INTO users (username, password) VALUES (?, ?)", (u, p))
                 db.commit()
+                session.permanent = True
                 session["user"] = u
                 db.close()
                 return redirect(url_for("dashboard"))
@@ -583,11 +586,21 @@ def campaign():
         ORDER BY cl.id DESC LIMIT 50
     """, (session["user"],)).fetchall()
 
+    # Stats for the info banner
+    base_q, base_p = "SELECT COUNT(*) FROM leads WHERE email IS NOT NULL AND email!='' AND assigned_to=?", [session["user"]]
+    if category:
+        base_q += " AND category=?"; base_p.append(category)
+    total_with_email  = db.execute(base_q, base_p).fetchone()[0]
+    contacted_count   = db.execute(
+        base_q + " AND status='Contacted'", base_p).fetchone()[0]
+
     return render_template("campaign.html",
         leads=leads, logs=logs, config=config,
         categories=CATEGORIES, statuses=STATUSES,
         current_user=session["user"],
-        active_category=category, active_status=status)
+        active_category=category, active_status=status,
+        total_with_email=total_with_email,
+        contacted_count=contacted_count)
 
 
 @app.route("/campaign/generate", methods=["POST"])
