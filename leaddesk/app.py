@@ -4,8 +4,10 @@ Flask + SQLite + Multi-AI + Gmail + CSV Import
 """
 
 import os, csv, io, json, sqlite3, smtplib, time, urllib.request
+import imaplib, email as email_lib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.header import decode_header as dh
 from datetime import datetime
 from functools import wraps
 from flask import (Flask, render_template, request, redirect,
@@ -18,24 +20,42 @@ BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 DB_PATH     = os.path.join(BASE_DIR, "leads.db")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
-USERS      = {"user1": "password123", "user2": "password123"}
 CATEGORIES = ["Gym", "Salon", "Car Detailing", "Agency", "Other"]
-STATUSES   = ["New", "Contacted", "Closed"]
+STATUSES   = ["New", "Contacted", "Replied", "Closed"]
 
 
 # ═══════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════
 
-def load_config():
+def load_config(username=None):
+    if not username:
+        return {}
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    row = db.execute("SELECT config_json FROM user_settings WHERE username=?", (username,)).fetchone()
+    db.close()
+    if row:
+        return json.loads(row["config_json"])
+    # Fallback to file for backward compatibility if user_settings is empty
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH) as f:
             return json.load(f)
     return {}
 
-def save_config(data):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(data, f, indent=2)
+def save_config(username, data):
+    if not username:
+        return
+    db = sqlite3.connect(DB_PATH)
+    config_str = json.dumps(data)
+    db.execute("""
+        INSERT INTO user_settings (username, config_json)
+        VALUES (?, ?)
+        ON CONFLICT(username) DO UPDATE SET config_json=excluded.config_json
+    """, (username, config_str))
+    db.commit()
+    db.close()
+
 
 
 # ═══════════════════════════════════════════════════════
@@ -54,34 +74,56 @@ def close_db(error):
     if db: db.close()
 
 def init_db():
-    db = sqlite3.connect(DB_PATH)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS leads (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            business_name TEXT    NOT NULL,
-            phone         TEXT    NOT NULL UNIQUE,
-            email         TEXT    UNIQUE,
-            website       TEXT,
-            category      TEXT    NOT NULL DEFAULT 'Other',
-            notes         TEXT,
-            status        TEXT    NOT NULL DEFAULT 'New',
-            assigned_to   TEXT    NOT NULL,
-            date_added    TEXT    NOT NULL
-        )
-    """)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS campaign_logs (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            lead_id  INTEGER NOT NULL,
-            email    TEXT    NOT NULL,
-            subject  TEXT    NOT NULL,
-            body     TEXT    NOT NULL,
-            status   TEXT    NOT NULL DEFAULT 'sent',
-            sent_at  TEXT    NOT NULL
-        )
-    """)
-    db.commit()
-    db.close()
+    try:
+        db = sqlite3.connect(DB_PATH)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                username TEXT PRIMARY KEY,
+                config_json TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_name TEXT    NOT NULL,
+                phone         TEXT    NOT NULL UNIQUE,
+                email         TEXT    UNIQUE,
+                website       TEXT,
+                category      TEXT    NOT NULL DEFAULT 'Other',
+                notes         TEXT,
+                status        TEXT    NOT NULL DEFAULT 'New',
+                assigned_to   TEXT    NOT NULL,
+                date_added    TEXT    NOT NULL,
+                reply_snippet TEXT
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS campaign_logs (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id  INTEGER NOT NULL,
+                email    TEXT    NOT NULL,
+                subject  TEXT    NOT NULL,
+                body     TEXT    NOT NULL,
+                status   TEXT    NOT NULL DEFAULT 'sent',
+                sent_at  TEXT    NOT NULL,
+                username TEXT    NOT NULL DEFAULT 'user1'
+            )
+        """)
+        try:
+            db.execute("ALTER TABLE campaign_logs ADD COLUMN username TEXT NOT NULL DEFAULT 'user1'")
+        except sqlite3.OperationalError:
+            pass # Column already exists
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"Database initialization error: {e}")
 
 
 # ═══════════════════════════════════════════════════════
@@ -116,11 +158,41 @@ def login():
     if request.method == "POST":
         u = request.form.get("username", "").strip()
         p = request.form.get("password", "")
-        if USERS.get(u) == p:
+        db = sqlite3.connect(DB_PATH)
+        db.row_factory = sqlite3.Row
+        user = db.execute("SELECT * FROM users WHERE username=?", (u,)).fetchone()
+        
+        if user and user["password"] == p:
             session["user"] = u
+            db.close()
             return redirect(url_for("dashboard"))
+            
+        db.close()
         error = "Invalid username or password."
     return render_template("login.html", error=error)
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if "user" in session:
+        return redirect(url_for("dashboard"))
+    error = None
+    if request.method == "POST":
+        u = request.form.get("username", "").strip()
+        p = request.form.get("password", "")
+        if not u or not p:
+            error = "Username and password are required."
+        else:
+            db = sqlite3.connect(DB_PATH)
+            try:
+                db.execute("INSERT INTO users (username, password) VALUES (?, ?)", (u, p))
+                db.commit()
+                session["user"] = u
+                db.close()
+                return redirect(url_for("dashboard"))
+            except sqlite3.IntegrityError:
+                error = "Username already exists."
+            db.close()
+    return render_template("login.html", error=error, is_register=True)
 
 @app.route("/logout")
 def logout():
@@ -141,21 +213,20 @@ def dashboard():
     status   = request.args.get("status", "")
     assigned = request.args.get("assigned", "")
 
-    q, p = "SELECT * FROM leads WHERE 1=1", []
+    q, p = "SELECT * FROM leads WHERE assigned_to=?", [session["user"]]
     if search:
         q += " AND (business_name LIKE ? OR phone LIKE ? OR email LIKE ?)"
         p += [f"%{search}%", f"%{search}%", f"%{search}%"]
     if category: q += " AND category=?";    p.append(category)
     if status:   q += " AND status=?";      p.append(status)
-    if assigned: q += " AND assigned_to=?"; p.append(assigned)
     q += " ORDER BY id DESC"
 
     leads = db.execute(q, p).fetchall()
     return render_template("dashboard.html",
         leads=leads, categories=CATEGORIES, statuses=STATUSES,
-        users=list(USERS.keys()), current_user=session["user"],
+        current_user=session["user"],
         search=search, active_category=category,
-        active_status=status, active_assigned=assigned)
+        active_status=status)
 
 
 # ═══════════════════════════════════════════════════════
@@ -172,7 +243,7 @@ def add_lead():
     website = request.form.get("website", "").strip() or None
     category= request.form.get("category", "Other")
     notes   = request.form.get("notes", "").strip() or None
-    assigned= request.form.get("assigned_to", "user1")
+    assigned= session["user"]
 
     if not name or not raw:
         flash("Business name and phone are required.", "error")
@@ -212,7 +283,7 @@ def import_csv():
     """
     db          = get_db()
     file        = request.files.get("csv_file")
-    assigned_to = request.form.get("import_assigned", "user1")
+    assigned_to = session["user"]
     default_cat = request.form.get("import_category", "Other")
 
     if not file or not file.filename.lower().endswith(".csv"):
@@ -305,27 +376,26 @@ def import_csv():
 @login_required
 def edit_lead(lead_id):
     db   = get_db()
-    lead = db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
+    lead = db.execute("SELECT * FROM leads WHERE id=? AND assigned_to=?", (lead_id, session["user"])).fetchone()
     if not lead:
         flash("Lead not found.", "error")
         return redirect(url_for("dashboard"))
     if request.method == "POST":
-        db.execute("UPDATE leads SET status=?,notes=?,assigned_to=? WHERE id=?",
+        db.execute("UPDATE leads SET status=?,notes=? WHERE id=? AND assigned_to=?",
                    (request.form.get("status", lead["status"]),
                     request.form.get("notes", "").strip() or None,
-                    request.form.get("assigned_to", lead["assigned_to"]),
-                    lead_id))
+                    lead_id, session["user"]))
         db.commit()
         flash("Lead updated.", "success")
         return redirect(url_for("dashboard"))
     return render_template("edit.html", lead=lead, statuses=STATUSES,
-                           users=list(USERS.keys()), current_user=session["user"])
+                           current_user=session["user"])
 
 @app.route("/delete/<int:lead_id>", methods=["POST"])
 @login_required
 def delete_lead(lead_id):
     db = get_db()
-    db.execute("DELETE FROM leads WHERE id=?", (lead_id,))
+    db.execute("DELETE FROM leads WHERE id=? AND assigned_to=?", (lead_id, session["user"]))
     db.commit()
     flash("Lead deleted.", "success")
     return redirect(url_for("dashboard"))
@@ -339,7 +409,8 @@ def delete_lead(lead_id):
 @login_required
 def export_emails():
     rows = get_db().execute(
-        "SELECT email FROM leads WHERE email IS NOT NULL AND email!='' ORDER BY id DESC"
+        "SELECT email FROM leads WHERE email IS NOT NULL AND email!='' AND assigned_to=? ORDER BY id DESC",
+        (session["user"],)
     ).fetchall()
     out = io.StringIO()
     w   = csv.writer(out)
@@ -356,10 +427,10 @@ def export_leads():
     db  = get_db()
     cat = request.args.get("category", "")
     if cat:
-        rows  = db.execute("SELECT * FROM leads WHERE category=? ORDER BY id DESC", (cat,)).fetchall()
+        rows  = db.execute("SELECT * FROM leads WHERE category=? AND assigned_to=? ORDER BY id DESC", (cat, session["user"])).fetchall()
         fname = f"leads_{cat.lower().replace(' ','_')}.csv"
     else:
-        rows  = db.execute("SELECT * FROM leads ORDER BY id DESC").fetchall()
+        rows  = db.execute("SELECT * FROM leads WHERE assigned_to=? ORDER BY id DESC", (session["user"],)).fetchall()
         fname = "leads_all.csv"
     out = io.StringIO()
     w   = csv.writer(out)
@@ -381,7 +452,7 @@ def export_leads():
 @app.route("/settings", methods=["GET", "POST"])
 @login_required
 def settings():
-    config = load_config()
+    config = load_config(session["user"])
     if request.method == "POST":
         config["ai_provider"]   = request.form.get("ai_provider", "groq")
         config["ai_api_key"]    = request.form.get("ai_api_key", "").strip()
@@ -390,7 +461,7 @@ def settings():
         config["sender_name"]   = request.form.get("sender_name", "").strip()
         config["gmail_address"] = request.form.get("gmail_address", "").strip()
         config["gmail_password"]= request.form.get("gmail_password", "").strip()
-        save_config(config)
+        save_config(session["user"], config)
         flash("Settings saved!", "success")
         return redirect(url_for("settings"))
     return render_template("settings.html", config=config, current_user=session["user"])
@@ -499,47 +570,34 @@ Respond ONLY in this exact JSON format with no markdown, no extra text:
 @login_required
 def campaign():
     db       = get_db()
-    config   = load_config()
+    config   = load_config(session["user"])
     category = request.args.get("category", "")
-    # Treat missing OR empty status as "New" so contacted leads are hidden by default.
-    # Pass "all" explicitly in the URL to show every lead.
-    status_param = request.args.get("status", "New").strip()
-    status = status_param if status_param else "New"
+    status   = request.args.get("status", "New")
 
-    q, p = "SELECT * FROM leads WHERE email IS NOT NULL AND email!=''", []
+    q, p = "SELECT * FROM leads WHERE email IS NOT NULL AND email!='' AND assigned_to=?", [session["user"]]
     if category: q += " AND category=?"; p.append(category)
-    if status != "all": q += " AND status=?"; p.append(status)
+    if status:   q += " AND status=?";   p.append(status)
     q += " ORDER BY id DESC"
     leads = db.execute(q, p).fetchall()
-
-    # Stats for the info banner
-    base_q, base_p = "SELECT COUNT(*) FROM leads WHERE email IS NOT NULL AND email!=''", []
-    if category:
-        base_q += " AND category=?"; base_p.append(category)
-    total_with_email  = db.execute(base_q, base_p).fetchone()[0]
-    contacted_count   = db.execute(
-        base_q.replace("COUNT(*)", "COUNT(*)") +
-        " AND status='Contacted'", base_p).fetchone()[0]
 
     logs = db.execute("""
         SELECT cl.*, l.business_name FROM campaign_logs cl
         JOIN leads l ON cl.lead_id=l.id
+        WHERE cl.username=?
         ORDER BY cl.id DESC LIMIT 50
-    """).fetchall()
+    """, (session["user"],)).fetchall()
 
     return render_template("campaign.html",
         leads=leads, logs=logs, config=config,
         categories=CATEGORIES, statuses=STATUSES,
         current_user=session["user"],
-        active_category=category, active_status=status,
-        total_with_email=total_with_email,
-        contacted_count=contacted_count)
+        active_category=category, active_status=status)
 
 
 @app.route("/campaign/generate", methods=["POST"])
 @login_required
 def generate_emails():
-    config      = load_config()
+    config      = load_config(session["user"])
     sender_name = config.get("sender_name", "").strip() or session["user"]
 
     if not config.get("ai_api_key", "").strip():
@@ -555,7 +613,7 @@ def generate_emails():
     results = []
 
     for lid in lead_ids:
-        lead = db.execute("SELECT * FROM leads WHERE id=?", (lid,)).fetchone()
+        lead = db.execute("SELECT * FROM leads WHERE id=? AND assigned_to=?", (lid, session["user"])).fetchone()
         if not lead or not lead["email"]:
             continue
         try:
@@ -567,7 +625,7 @@ def generate_emails():
                 "email": lead["email"], "subject": gen.get("subject", ""),
                 "body": gen.get("body", "")
             })
-            time.sleep(0.2)
+            time.sleep(0.4)
         except Exception as e:
             results.append({
                 "lead_id": lead["id"], "business_name": lead["business_name"],
@@ -580,7 +638,7 @@ def generate_emails():
 @app.route("/campaign/send", methods=["POST"])
 @login_required
 def send_emails():
-    config  = load_config()
+    config  = load_config(session["user"])
     gmail   = config.get("gmail_address", "").strip()
     pw      = config.get("gmail_password", "").strip()
     sender  = config.get("sender_name", "").strip() or session["user"]
@@ -592,16 +650,17 @@ def send_emails():
     if not items:
         return jsonify({"error": "No emails to send."}), 400
 
+    # Test login once before starting
+    try:
+        test = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15)
+        test.login(gmail, pw)
+        test.quit()
+    except Exception as e:
+        return jsonify({"error": f"Gmail login failed: {str(e)}. Check your App Password in Settings."}), 500
+
     db = get_db()
     sent, failed = [], []
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    # Open ONE persistent SMTP connection for the entire batch
-    try:
-        srv = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30)
-        srv.login(gmail, pw)
-    except Exception as e:
-        return jsonify({"error": f"Gmail login failed: {str(e)}. Check your App Password in Settings."}), 500
 
     for item in items:
         lid  = item.get("lead_id")
@@ -610,45 +669,35 @@ def send_emails():
         body = item.get("body", "")
 
         try:
+            # Fresh SMTP connection per email — avoids timeout on multiple sends
+            srv = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15)
+            srv.login(gmail, pw)
+
             msg = MIMEMultipart("alternative")
             msg["Subject"] = subj
             msg["From"]    = f"{sender} <{gmail}>"
             msg["To"]      = to
             msg.attach(MIMEText(body, "plain"))
             srv.sendmail(gmail, to, msg.as_string())
+            srv.quit()
 
             db.execute(
-                "INSERT INTO campaign_logs (lead_id,email,subject,body,status,sent_at) VALUES (?,?,?,?,?,?)",
-                (lid, to, subj, body, "sent", now))
-            db.execute("UPDATE leads SET status='Contacted' WHERE id=?", (lid,))
+                "INSERT INTO campaign_logs (lead_id,email,subject,body,status,sent_at,username) VALUES (?,?,?,?,?,?,?)",
+                (lid, to, subj, body, "sent", now, session["user"]))
+            db.execute("UPDATE leads SET status='Contacted' WHERE id=? AND assigned_to=?", (lid, session["user"]))
             db.commit()
             sent.append(to)
-            time.sleep(0.5)  # small delay to avoid spam filters
+            time.sleep(1)  # 1s delay — enough to avoid spam, won't timeout
 
         except Exception as e:
             try:
                 db.execute(
-                    "INSERT INTO campaign_logs (lead_id,email,subject,body,status,sent_at) VALUES (?,?,?,?,?,?)",
-                    (lid, to, subj, body, "failed", now))
+                    "INSERT INTO campaign_logs (lead_id,email,subject,body,status,sent_at,username) VALUES (?,?,?,?,?,?,?)",
+                    (lid, to, subj, body, "failed", now, session["user"]))
                 db.commit()
             except Exception:
                 pass
             failed.append({"email": to, "error": str(e)})
-            # If the SMTP connection dropped, try to reconnect for the next email
-            try:
-                srv.quit()
-            except Exception:
-                pass
-            try:
-                srv = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30)
-                srv.login(gmail, pw)
-            except Exception:
-                pass
-
-    try:
-        srv.quit()
-    except Exception:
-        pass
 
     return jsonify({
         "sent":    sent,
@@ -656,6 +705,132 @@ def send_emails():
         "message": f"{len(sent)} sent, {len(failed)} failed."
     })
 
+
+
+# ═══════════════════════════════════════════════════════
+# REPLY DETECTION (IMAP)
+# ═══════════════════════════════════════════════════════
+
+def decode_str(s):
+    """Decode email header string."""
+    if s is None:
+        return ""
+    parts = dh(s)
+    result = []
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            result.append(part.decode(enc or "utf-8", errors="ignore"))
+        else:
+            result.append(part)
+    return "".join(result)
+
+
+@app.route("/check-replies", methods=["POST"])
+@login_required
+def check_replies():
+    """
+    Connect to Gmail via IMAP, scan inbox for replies from leads,
+    update lead status to Replied and store snippet.
+    """
+    config = load_config(session["user"])
+    gmail  = config.get("gmail_address", "").strip()
+    pw     = config.get("gmail_password", "").strip()
+
+    if not gmail or not pw:
+        return jsonify({"error": "Gmail not configured. Go to Settings."}), 400
+
+    db = get_db()
+
+    # Get all leads that were contacted — only check those
+    leads = db.execute(
+        "SELECT id, email, business_name FROM leads WHERE email IS NOT NULL AND status IN ('Contacted','New') AND assigned_to=?",
+        (session["user"],)
+    ).fetchall()
+
+    if not leads:
+        return jsonify({"checked": 0, "replied": 0, "message": "No contacted leads to check."})
+
+    # Build a lookup: email address → lead id
+    email_to_lead = {row["email"].lower(): row["id"] for row in leads if row["email"]}
+
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        mail.login(gmail, pw)
+        mail.select("INBOX")
+    except Exception as e:
+        return jsonify({"error": f"Gmail IMAP login failed: {str(e)}"}), 500
+
+    replied = []
+
+    try:
+        # Search all messages in inbox
+        _, msg_ids = mail.search(None, "ALL")
+        ids = msg_ids[0].split()
+
+        # Only check last 200 emails to keep it fast
+        ids = ids[-200:] if len(ids) > 200 else ids
+
+        for mid in ids:
+            try:
+                _, msg_data = mail.fetch(mid, "(RFC822)")
+                raw = msg_data[0][1]
+                msg = email_lib.message_from_bytes(raw)
+
+                from_header = decode_str(msg.get("From", ""))
+                from_email  = ""
+
+                # Extract email address from From header
+                if "<" in from_header and ">" in from_header:
+                    from_email = from_header.split("<")[1].split(">")[0].strip().lower()
+                else:
+                    from_email = from_header.strip().lower()
+
+                # Check if this sender is one of our leads
+                if from_email not in email_to_lead:
+                    continue
+
+                lead_id = email_to_lead[from_email]
+
+                # Get email body snippet
+                snippet = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            try:
+                                snippet = part.get_payload(decode=True).decode("utf-8", errors="ignore")[:300]
+                            except Exception:
+                                snippet = ""
+                            break
+                else:
+                    try:
+                        snippet = msg.get_payload(decode=True).decode("utf-8", errors="ignore")[:300]
+                    except Exception:
+                        snippet = ""
+
+                snippet = snippet.strip()
+
+                # Update lead status to Replied
+                db.execute(
+                    "UPDATE leads SET status='Replied', reply_snippet=? WHERE id=? AND status NOT IN ('Closed','Replied') AND assigned_to=?",
+                    (snippet, lead_id, session["user"])
+                )
+                db.commit()
+                replied.append(from_email)
+
+            except Exception:
+                continue
+
+        mail.logout()
+
+    except Exception as e:
+        return jsonify({"error": f"Error scanning inbox: {str(e)}"}), 500
+
+    return jsonify({
+        "checked":  len(ids),
+        "replied":  len(set(replied)),
+        "emails":   list(set(replied)),
+        "message":  f"Scanned {len(ids)} emails. Found {len(set(replied))} replies."
+    })
 
 # ═══════════════════════════════════════════════════════
 # ENTRY POINT
